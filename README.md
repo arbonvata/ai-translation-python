@@ -13,6 +13,10 @@ extract ──► missing_translations.json ──► translate ──► transl
                                                               write-back ──► values-<lang>/*.xml
 ```
 
+`translate` either calls the DeepL API directly, or routes through the godeepl-server
+proxy (sibling repo `../gotranslation`) via `DEEPL_BASE_URL` — see
+[Translation proxy](#translation-proxy-godeepl-server).
+
 ## Requirements
 
 - Python 3
@@ -72,12 +76,22 @@ writes:
 - `translations.json` — combined output, one entry per (source file, language)
 - `translations_da.json` … `translations_sv.json` — one file per language
 
+With `DEEPL_BASE_URL` exported (see [Translation proxy](#translation-proxy-godeepl-server))
+the same command routes through the godeepl-server instead — every text travels under its
+Android name, translations are cached in the server's database, and the client's
+`DEEPL_API_KEY` can be any dummy value.
+
 The output objects have the same shape as the extraction output; only `value` is translated.
 A full run is roughly 60–70k characters, well within the free tier's 500k/month.
 
 Details worth knowing:
 
 - Texts are sent in batches of 50 (DeepL's per-request limit).
+- DeepL's API has no per-text id field: request and response correlate purely by array
+  position. The script carries the Android ids alongside every request and verifies the
+  response count per batch — if DeepL ever returned fewer or more translations than texts
+  sent, the run aborts with a message naming the affected strings (`hello..pending`) instead
+  of silently shifting translations against the wrong ids.
 - Each `<string-array>` is sent as its own request with the Android comment passed as DeepL's
   `context` parameter — short items like `Mon` are ambiguous without it.
 - Plural forms are translated individually; this works because the target languages share
@@ -101,17 +115,60 @@ destination if it already exists and **upserts**: plain strings by `name`, plura
 - The `context` comment is written above each element, mirroring the source file. The
   `tools:ignore="MissingTranslation"` marker is never written to locale files (and is removed
   from existing elements) — it belongs on the source strings only.
+- Once an entry has been written into **every** language folder (`da, de, es, fr, sv`), its
+  `tools:ignore="MissingTranslation"` marker is removed from the original `values/` file, so the
+  next extraction run no longer reports it as missing. Entries translated into only some
+  languages keep their marker. Other values in `tools:ignore` (e.g. `Typos`) are preserved, and
+  passing a per-language file like `translations_da.json` removes nothing — only the combined
+  `translations.json` covers all languages.
 - `--dry-run` shows what would happen without writing anything.
 - Re-running is safe: unchanged entries are skipped ("unchanged, skipped"), changed ones are
   updated in place. You can hand-edit `translations_*.json` to fix a translation and re-run.
+
+## Translation proxy (godeepl-server)
+
+The [godeepl-server](../gotranslation) is a caching proxy in front of DeepL: it keeps the
+real API key server-side and caches every translation in its database under the Android
+resource name. Point the client at it with a dummy key:
+
+```bash
+export DEEPL_BASE_URL="http://127.0.0.1:8080"
+export DEEPL_API_KEY="local"   # any non-empty value; the proxy replaces it with the real key
+python3 translate.py --translate
+```
+
+In this mode every text is sent under its Android name and translations are matched back
+by id — never by position. The client aborts if an id is missing from the response or
+returned twice.
+
+```json
+request:  POST {DEEPL_BASE_URL}/v2/translate
+          {"source_lang": "EN", "target_lang": "DA", "preserve_formatting": true,
+           "texts": [{"id": "screen_title_about", "text": "About", "context": "Screen title"}]}
+
+response: {"translations": [{"id": "screen_title_about", "text": "Om",
+                             "detected_source_language": "EN"}]}
+```
+
+`context` is the `<!-- comment -->` above the string in the source file, omitted when
+there is none. Texts are batched 50 per request — DeepL's per-request limit, since the
+proxy forwards each same-options group to DeepL in one call. Errors keep DeepL's
+`{"message": ...}` shape and status codes, so they read exactly like direct-API errors.
+
+**Caching caveat:** the proxy keys its cache by id, languages and options — deliberately
+*not* by source text. If you edit an English string, its id stays the same and the proxy
+returns the previously cached translation. To force a re-translation, rename the resource
+or stop the server and clear its database file.
 
 ## Typical full cycle
 
 ```bash
 # after changing English source strings:
 python3 translate.py /path/to/app/src/main/res missing_translations.json
-python3 translate.py --translate
+python3 translate.py --translate          # set DEEPL_BASE_URL to use the godeepl-server proxy
 python3 translate.py --write-back
+# fully translated strings lose their MissingTranslation marker in values/,
+# so the next extraction only reports what is still missing
 # then rebuild the app (AAPT2 validates the locale files)
 ```
 
@@ -119,6 +176,7 @@ python3 translate.py --write-back
 
 - The locale `values-*/` files are never a source for extraction — only the default `values/`
   folder is read, and only entries marked `tools:ignore="MissingTranslation"`.
-- `DEEPL_API_KEY` is only needed for step 2; extraction and write-back work offline.
+- `DEEPL_API_KEY` is only needed for step 2 (any dummy value when `DEEPL_BASE_URL` is set);
+  extraction and write-back work offline.
 - DeepL errors are reported with their HTTP status (403 = invalid key, 429 = rate limit,
   456 = quota exhausted).

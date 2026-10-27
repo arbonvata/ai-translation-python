@@ -104,12 +104,17 @@ def extract_missing_translations(file_path: str) -> List[StringResource]:
     return results
 
 def deepl_translate_texts(texts: List[str], target_language: str, api_key: str,
-                          source_language: str = "EN", context: str = None) -> List[str]:
-    """Translate a list of strings with the DeepL API, batching up to 50 texts per request."""
+                          source_language: str = "EN", context: str = None,
+                          ids: List[str] = None) -> List[str]:
+    """Translate a list of strings with the DeepL API, batching up to 50 texts per request.
+
+    DeepL's request format has no per-text id field — request and response correlate
+    by position — so ids travel alongside and are used to verify each response."""
     endpoint = DEEPL_FREE_ENDPOINT if api_key.endswith(":fx") else DEEPL_PRO_ENDPOINT
     translations = []
     for start in range(0, len(texts), MAX_TEXTS_PER_REQUEST):
         chunk = texts[start:start + MAX_TEXTS_PER_REQUEST]
+        chunk_ids = ids[start:start + MAX_TEXTS_PER_REQUEST] if ids else []
         payload = {
             "text": chunk,
             "source_lang": source_language,
@@ -130,8 +135,24 @@ def deepl_translate_texts(texts: List[str], target_language: str, api_key: str,
             # 403 = invalid key, 429 = too many requests, 456 = quota exceeded
             print(f"DeepL API error for '{target_language}': {e} {response.text}", file=sys.stderr)
             sys.exit(1)
-        translations.extend(t["text"] for t in response.json()["translations"])
+        results = [t["text"] for t in response.json()["translations"]]
+        if len(results) != len(chunk):
+            # DeepL promises one translation per text, in order; anything else
+            # would silently shift every string after this point
+            span = chunk_ids[0] if len(chunk_ids) <= 1 else f"{chunk_ids[0]}..{chunk_ids[-1]}"
+            print(f"DeepL returned {len(results)} translations for {len(chunk)} texts "
+                  f"({span}) to '{target_language}' — aborting", file=sys.stderr)
+            sys.exit(1)
+        translations.extend(results)
     return translations
+
+def resource_label(resource: StringResource) -> str:
+    """Human-readable id for a resource, e.g. tab_month, week_days[0], items (one)."""
+    if resource.type == 'string-array':
+        return f"{resource.name}[{resource.index}]"
+    if resource.type == 'plurals':
+        return f"{resource.name} ({resource.quantity})"
+    return resource.name
 
 def translate_resources(resources: List[StringResource], target_language: str,
                         api_key: str) -> List[StringResource]:
@@ -141,7 +162,8 @@ def translate_resources(resources: List[StringResource], target_language: str,
     # Plain strings and plurals: translate in shared batches
     plain_indices = [i for i, r in enumerate(resources) if r.type != 'string-array']
     plain_values = deepl_translate_texts(
-        [resources[i].value for i in plain_indices], target_language, api_key)
+        [resources[i].value for i in plain_indices], target_language, api_key,
+        ids=[resource_label(resources[i]) for i in plain_indices])
     for i, value in zip(plain_indices, plain_values):
         translated_values[i] = value
 
@@ -157,7 +179,8 @@ def translate_resources(resources: List[StringResource], target_language: str,
             array_context = None
         values = deepl_translate_texts(
             [resources[i].value for i in indices], target_language, api_key,
-            context=array_context)
+            context=array_context,
+            ids=[resource_label(resources[i]) for i in indices])
         for i, value in zip(indices, values):
             translated_values[i] = value
 
@@ -165,6 +188,56 @@ def translate_resources(resources: List[StringResource], target_language: str,
         replace(resource, value=translated_values[i])
         for i, resource in enumerate(resources)
     ]
+
+def proxy_translate_resources(resources: List[StringResource], target_language: str,
+                              base_url: str, api_key: str,
+                              source_language: str = "EN") -> List[StringResource]:
+    """Translate through the godeepl-server proxy (DEEPL_BASE_URL): every text travels
+    under its Android name so the server can cache translations per id; responses are
+    matched back by name. Batched at 50 texts per request — the proxy forwards each
+    same-options group to DeepL in one call and DeepL caps requests at 50 texts."""
+    endpoint = f"{base_url.rstrip('/')}/v2/translate"
+    headers = {"Authorization": f"DeepL-Auth-Key {api_key}"}
+
+    translated = []
+    for start in range(0, len(resources), MAX_TEXTS_PER_REQUEST):
+        chunk = resources[start:start + MAX_TEXTS_PER_REQUEST]
+        payload = {
+            "source_lang": source_language,
+            "target_lang": target_language.upper(),
+            "preserve_formatting": True,
+            "texts": [
+                {
+                    "id": resource_label(resource),
+                    "text": resource.value,
+                    **({"context": resource.context}
+                       if resource.context and resource.context != "No context found" else {}),
+                }
+                for resource in chunk
+            ],
+        }
+        response = requests.post(endpoint, json=payload, headers=headers, timeout=300)
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            print(f"Translation proxy error for '{target_language}': {e} {response.text}",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        by_id = {}
+        for item in response.json()["translations"]:
+            if item["id"] in by_id:
+                print(f"Translation proxy returned '{item['id']}' twice — aborting", file=sys.stderr)
+                sys.exit(1)
+            by_id[item["id"]] = item["text"]
+        for resource in chunk:
+            label = resource_label(resource)
+            if label not in by_id:
+                print(f"Translation proxy returned nothing for '{label}' — aborting",
+                      file=sys.stderr)
+                sys.exit(1)
+            translated.append(replace(resource, value=by_id[label]))
+    return translated
 
 def placeholder_warnings(source_value: str, translated_value: str) -> List[str]:
     """Android placeholders (%1$s, %2$d, ...) and escaped apostrophes must survive translation."""
@@ -177,12 +250,20 @@ def placeholder_warnings(source_value: str, translated_value: str) -> List[str]:
     return problems
 
 def run_translation(input_file: str, output_file: str) -> None:
-    """Reads an extraction report, translates every string into TARGET_LANGUAGES via DeepL."""
+    """Reads an extraction report, translates every string into TARGET_LANGUAGES.
+
+    Routes through the godeepl-server proxy when DEEPL_BASE_URL is set,
+    otherwise calls DeepL directly."""
+    base_url = os.environ.get("DEEPL_BASE_URL")
     api_key = os.environ.get("DEEPL_API_KEY")
     if not api_key:
         print("Error: DEEPL_API_KEY environment variable is not set.", file=sys.stderr)
         print("Get a free key at https://www.deepl.com/pro-api and run:", file=sys.stderr)
-        print("  export DEEPL_API_KEY=\"<your key>\"", file=sys.stderr)
+        print('  export DEEPL_API_KEY="<your key>"', file=sys.stderr)
+        print("Or route through the godeepl-server proxy (../gotranslation) with any dummy key:",
+              file=sys.stderr)
+        print('  export DEEPL_BASE_URL="http://127.0.0.1:8080" DEEPL_API_KEY="local"',
+              file=sys.stderr)
         sys.exit(1)
 
     with open(input_file, 'r', encoding='utf-8') as f:
@@ -195,7 +276,10 @@ def run_translation(input_file: str, output_file: str) -> None:
         file_name = Path(file_entry["file"]).name
         for language in TARGET_LANGUAGES:
             print(f"Translating {len(resources)} strings from '{file_name}' to {language}...")
-            translated = translate_resources(resources, language, api_key)
+            if base_url:
+                translated = proxy_translate_resources(resources, language, base_url, api_key)
+            else:
+                translated = translate_resources(resources, language, api_key)
 
             warnings.extend(
                 f"[{language}] {source.name}: '{problem}' missing in '{item.value}'"
@@ -392,12 +476,15 @@ def upsert_string_array(soup, root, group: List[dict]) -> str:
     return "added" if created else "updated"
 
 def write_language_file(source_file: str, language: str, translations: List[dict],
-                        dry_run: bool = False) -> None:
-    """Writes one translated source file into its values-<language> counterpart."""
+                        dry_run: bool = False) -> bool:
+    """Writes one translated source file into its values-<language> counterpart.
+
+    Returns True when the destination file now holds these translations
+    (created, updated or already unchanged), False when it was skipped."""
     destination = android_destination(source_file, language)
     if destination is None:
         print(f"Skipping '{source_file}': not inside a 'values' folder", file=sys.stderr)
-        return
+        return False
 
     if destination.is_file():
         with open(destination, 'r', encoding='utf-8') as f:
@@ -439,12 +526,15 @@ def write_language_file(source_file: str, language: str, translations: List[dict
         verb = "would create" if created else "would update"
         print(f"{verb} {destination} "
               f"(add {counts['added']}, update {counts['updated']}, unchanged {counts['unchanged']})")
-        return
+        return True
     if counts["added"] == counts["updated"] == 0:
         print(f"unchanged, skipped {destination}")
-        return
+        return True
 
     destination.parent.mkdir(parents=True, exist_ok=True)
+    if created:
+        # A freshly built tree has no newline before </resources>
+        root.append(NavigableString("\n"))
     body = str(soup)
     if body.startswith("<?xml"):
         body = body.split("?>", 1)[1].lstrip("\n")
@@ -453,13 +543,66 @@ def write_language_file(source_file: str, language: str, translations: List[dict
     verb = "created" if created else "updated"
     print(f"{verb} {destination} "
           f"(add {counts['added']}, update {counts['updated']}, unchanged {counts['unchanged']})")
+    return True
+
+def clean_source_markers(source_file: str, completed: set, dry_run: bool = False) -> None:
+    """Removes MissingTranslation markers from source entries translated into every language."""
+    with open(source_file, 'r', encoding='utf-8') as f:
+        soup = BeautifulSoup(f, 'xml')
+    root = soup.find("resources")
+    reindent(root, "    ", "")
+    for element in root.find_all(["plurals", "string-array"]):
+        reindent(element, "        ", "    ")
+
+    # Entries are keyed the way extraction stores them: plain strings carry
+    # no type, arrays and plurals use their tag name
+    removed = 0
+    for tag in root.find_all(['string', 'string-array', 'plurals']):
+        tag_type = None if tag.name == 'string' else tag.name
+        if (tag_type, tag.get('name')) not in completed:
+            continue
+        if 'MissingTranslation' not in tag.get('tools:ignore', ''):
+            continue
+        drop_missing_translation_marker(tag)
+        removed += 1
+
+    if dry_run:
+        print(f"would remove MissingTranslation from {removed} entries in {source_file}")
+        return
+    if not removed:
+        return
+    body = str(soup)
+    if body.startswith("<?xml"):
+        body = body.split("?>", 1)[1].lstrip("\n")
+    with open(source_file, 'w', encoding='utf-8') as f:
+        f.write('<?xml version="1.0" encoding="utf-8"?>\n' + body + "\n")
+    print(f"removed MissingTranslation from {removed} entries in {source_file}")
 
 def run_write_back(input_file: str, dry_run: bool = False) -> None:
-    """Writes every translation from the combined output into the Android values-<lang> folders."""
+    """Writes every translation from the combined output into the Android values-<lang> folders,
+    then removes the source MissingTranslation markers that are now fully translated."""
     with open(input_file, 'r', encoding='utf-8') as f:
         entries = json.load(f)
+
+    # Group by source file: a marker may only be dropped once EVERY target
+    # language of that file was written successfully
+    entries_by_file = {}
     for entry in entries:
-        write_language_file(entry["file"], entry["language"], entry["translations"], dry_run)
+        entries_by_file.setdefault(entry["file"], []).append(entry)
+
+    for source_file, file_entries in entries_by_file.items():
+        written = {}  # (type, name) -> languages whose locale file now holds the entry
+        for entry in file_entries:
+            if not write_language_file(entry["file"], entry["language"],
+                                       entry["translations"], dry_run):
+                continue
+            for translation in entry["translations"]:
+                key = (translation.get("type"), translation["name"])
+                written.setdefault(key, set()).add(entry["language"])
+        completed = {key for key, languages in written.items()
+                     if languages >= set(TARGET_LANGUAGES)}
+        if completed:
+            clean_source_markers(source_file, completed, dry_run)
 
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] == "--translate":
@@ -481,6 +624,7 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python3 translate.py <folder_path>                     extract strings to JSON", file=sys.stderr)
         print("       python3 translate.py --translate [input] [output]      translate via DeepL API", file=sys.stderr)
+        print("         set DEEPL_BASE_URL to route through a godeepl-server proxy", file=sys.stderr)
         print("       python3 translate.py --write-back [input] [--dry-run]  write values-<lang> XML files", file=sys.stderr)
         print("Example: python3 translate.py ./app/src/main/res", file=sys.stderr)
         sys.exit(1)

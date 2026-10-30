@@ -19,11 +19,13 @@ proxy (sibling repo `../gotranslation`) via `DEEPL_BASE_URL` — see
 
 ## Requirements
 
-- Python 3
+- Python 3.11 or later
 - Packages: `beautifulsoup4` (with `lxml` for the XML parser) and `requests`
 
   ```bash
-  pip install beautifulsoup4 lxml requests
+  python3 -m venv .venv
+  source .venv/bin/activate
+  python -m pip install -r requirements.txt
   ```
 
 - A DeepL API key (a free key works: <https://www.deepl.com/pro-api>). Free-tier keys end in
@@ -61,7 +63,12 @@ must be marked with that attribute to be picked up. For each entry it records:
 | `quantity` | Only for plurals: `one`, `other`, …                                 |
 | `index`  | Only for string-arrays: item position (0-based)                      |
 
-Plain strings keep the exact three-key shape; the extra fields only appear on array/plural items.
+Plain text strings keep the three-key shape. Arrays and plurals include the extra
+fields listed above. Any resource containing inline XML also includes `"markup": true`;
+its `value` contains serialized XML, including namespace declarations needed by
+`<xliff:g>` placeholders. Leading/trailing whitespace and spaces around inline tags
+are preserved. Existing reports without `markup` continue to be treated as plain text.
+Re-extract older reports to recover markup or whitespace previously removed.
 
 ### 2. Translate with DeepL
 
@@ -87,6 +94,15 @@ A full run is roughly 60–70k characters, well within the free tier's 500k/mont
 Details worth knowing:
 
 - Texts are sent in batches of 50 (DeepL's per-request limit).
+- Batches containing inline markup use [DeepL XML handling](https://github.com/DeepL/openapi/blob/main/openapi.yaml)
+  (`tag_handling: xml`) and `ignore_tags: ["xliff:g"]` to keep placeholder contents
+  untranslated. Plain text in these batches is XML-escaped before sending and decoded
+  after translation. Plain-text-only batches keep their existing request format.
+  XML options create a separate proxy cache variant; an initial markup translation
+  may therefore call DeepL even if an older plain-text translation was cached.
+- Write-back restores inline elements as XML nodes and escapes apostrophes in text,
+  without changing attribute values. Malformed translated XML is rejected before
+  writing its destination file. Review translated formatting before applying it.
 - DeepL's API has no per-text id field: request and response correlate purely by array
   position. The script carries the Android ids alongside every request and verifies the
   response count per batch — if DeepL ever returned fewer or more translations than texts
@@ -193,3 +209,18 @@ python3 translate.py --write-back
   extraction and write-back work offline.
 - DeepL errors are reported with their HTTP status (403 = invalid key, 429 = rate limit,
   456 = quota exhausted).
+
+## Development
+
+Install dependencies using the virtual environment instructions above, then run:
+
+```bash
+python -m unittest discover -v
+```
+
+Tests cover XML extraction and write-back (including whitespace, formatting tags,
+arrays, plurals, and namespaced placeholders), repeated write-back, placeholder
+counts, request batching, response ID mapping, and the proxy override flag. API
+requests are mocked: tests do not require credentials or spend translation quota.
+GitHub Actions runs the suite on Python 3.11 and 3.14. Live DeepL translation and
+Android builds are not part of this test suite.

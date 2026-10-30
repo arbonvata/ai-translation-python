@@ -1,5 +1,9 @@
 import sys
 import argparse
+import html
+from copy import deepcopy
+from collections import Counter
+from xml.etree import ElementTree
 import json
 import os
 import re
@@ -30,6 +34,7 @@ class StringResource:
     type: str = None        # "string-array" or "plurals"
     quantity: str = None    # plurals only: "one", "other", ...
     index: int = None       # string-array only: item position
+    markup: bool = None     # True when value contains serialized inline XML
 
     def to_dict(self) -> dict:
         """asdict() without the None fields, so plain strings keep the same JSON shape."""
@@ -60,11 +65,63 @@ def comment_above(tag) -> str:
         # Whitespace-only text node between comment and tag -> keep walking
     return "No context found"
 
+def resource_value(tag):
+    """Keep whitespace and inline XML; plain values remain ordinary JSON strings."""
+    if tag.find() is None:
+        return {"value": tag.get_text()}
+    # Namespace declarations on <resources> must travel with extracted fragments.
+    fragment = deepcopy(tag)
+    for child in fragment.find_all():
+        if child.prefix and child.namespace:
+            child.attrs.setdefault(f"xmlns:{child.prefix}", child.namespace)
+    return {"value": fragment.decode_contents(), "markup": True}
+
+
+def translation_value(resource, use_xml=True):
+    """Send well-formed XML, escaping plain text when sharing a markup batch."""
+    if not use_xml:
+        return resource.value
+    value = resource.value if resource.markup else html.escape(resource.value, quote=False)
+    wrapped = f"<resource>{value}</resource>"
+    ElementTree.fromstring(wrapped)
+    return wrapped
+
+
+def translated_resource(resource, value, use_xml=True):
+    """Validate translated XML and remove the transport-only wrapper."""
+    if not use_xml:
+        return replace(resource, value=value)
+    root = ElementTree.fromstring(value)
+    if root.tag != "resource":
+        raise ValueError("Translated XML is missing its resource wrapper")
+    if resource.markup:
+        fragment = BeautifulSoup(value, "xml", preserve_whitespace_tags={"resource"})
+        return replace(resource, value=fragment.resource.decode_contents())
+    return replace(resource, value="".join(root.itertext()))
+
+
+def set_resource_value(tag, entry):
+    """Write translated inline nodes as XML, escaping apostrophes in text only."""
+    value = entry["value"]
+    if not entry.get("markup"):
+        tag.string = escape_android_value(value)
+        return
+    ElementTree.fromstring(f"<resource>{value}</resource>")
+    fragment = BeautifulSoup(f"<resource>{value}</resource>", "xml",
+                             preserve_whitespace_tags={"resource"}).resource
+    for node in list(fragment.descendants):
+        if isinstance(node, NavigableString) and not isinstance(node, Comment):
+            node.replace_with(NavigableString(escape_android_value(str(node))))
+    tag.clear()
+    for node in list(fragment.contents):
+        tag.append(node.extract())
+
+
 def extract_missing_translations(file_path: str) -> List[StringResource]:
     """Parses a single XML file and returns a list of StringResource objects."""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
-            soup = BeautifulSoup(f, 'xml')
+            soup = BeautifulSoup(f, 'xml', preserve_whitespace_tags={'string', 'item', 'resource'})
     except FileNotFoundError:
         print(f"Error: File not found at '{file_path}'", file=sys.stderr)
         sys.exit(1)
@@ -81,14 +138,14 @@ def extract_missing_translations(file_path: str) -> List[StringResource]:
         if tag.name == 'string':
             results.append(StringResource(
                 name=name,
-                value=tag.get_text(strip=True),
+                **resource_value(tag),
                 context=context
             ))
         elif tag.name == 'string-array':
             for index, item in enumerate(tag.find_all('item')):
                 results.append(StringResource(
                     name=name,
-                    value=item.get_text(strip=True),
+                    **resource_value(item),
                     context=context,
                     type='string-array',
                     index=index
@@ -97,7 +154,7 @@ def extract_missing_translations(file_path: str) -> List[StringResource]:
             for item in tag.find_all('item'):
                 results.append(StringResource(
                     name=name,
-                    value=item.get_text(strip=True),
+                    **resource_value(item),
                     context=context,
                     type='plurals',
                     quantity=item.get('quantity')
@@ -106,7 +163,7 @@ def extract_missing_translations(file_path: str) -> List[StringResource]:
 
 def deepl_translate_texts(texts: List[str], target_language: str, api_key: str,
                           source_language: str = "EN", context: str = None,
-                          ids: List[str] = None) -> List[str]:
+                          ids: List[str] = None, use_xml: bool = False) -> List[str]:
     """Translate a list of strings with the DeepL API, batching up to 50 texts per request.
 
     DeepL's request format has no per-text id field — request and response correlate
@@ -122,6 +179,9 @@ def deepl_translate_texts(texts: List[str], target_language: str, api_key: str,
             "target_lang": target_language.upper(),
             "preserve_formatting": True,
         }
+        if use_xml:
+            payload["tag_handling"] = "xml"
+            payload["ignore_tags"] = ["xliff:g"]
         if context:
             payload["context"] = context
         response = requests.post(
@@ -159,12 +219,13 @@ def translate_resources(resources: List[StringResource], target_language: str,
                         api_key: str) -> List[StringResource]:
     """Translate the value of every StringResource; name and context are kept unchanged."""
     translated_values = {}
+    use_xml = any(resource.markup for resource in resources)
 
     # Plain strings and plurals: translate in shared batches
     plain_indices = [i for i, r in enumerate(resources) if r.type != 'string-array']
     plain_values = deepl_translate_texts(
-        [resources[i].value for i in plain_indices], target_language, api_key,
-        ids=[resource_label(resources[i]) for i in plain_indices])
+        [translation_value(resources[i], use_xml) for i in plain_indices], target_language, api_key,
+        ids=[resource_label(resources[i]) for i in plain_indices], use_xml=use_xml)
     for i, value in zip(plain_indices, plain_values):
         translated_values[i] = value
 
@@ -179,14 +240,14 @@ def translate_resources(resources: List[StringResource], target_language: str,
         if array_context == "No context found":
             array_context = None
         values = deepl_translate_texts(
-            [resources[i].value for i in indices], target_language, api_key,
+            [translation_value(resources[i], use_xml) for i in indices], target_language, api_key,
             context=array_context,
-            ids=[resource_label(resources[i]) for i in indices])
+            ids=[resource_label(resources[i]) for i in indices], use_xml=use_xml)
         for i, value in zip(indices, values):
             translated_values[i] = value
 
     return [
-        replace(resource, value=translated_values[i])
+        translated_resource(resource, translated_values[i], use_xml)
         for i, resource in enumerate(resources)
     ]
 
@@ -206,6 +267,7 @@ def proxy_translate_resources(resources: List[StringResource], target_language: 
     translated = []
     for start in range(0, len(resources), MAX_TEXTS_PER_REQUEST):
         chunk = resources[start:start + MAX_TEXTS_PER_REQUEST]
+        use_xml = any(resource.markup for resource in chunk)
         payload = {
             "source_lang": source_language,
             "target_lang": target_language.upper(),
@@ -213,13 +275,16 @@ def proxy_translate_resources(resources: List[StringResource], target_language: 
             "texts": [
                 {
                     "id": resource_label(resource),
-                    "text": resource.value,
+                    "text": translation_value(resource, use_xml),
                     **({"context": resource.context}
                        if resource.context and resource.context != "No context found" else {}),
                 }
                 for resource in chunk
             ],
         }
+        if use_xml:
+            payload["tag_handling"] = "xml"
+            payload["ignore_tags"] = ["xliff:g"]
         # Cache control belongs to the Go proxy, never the direct DeepL API.
         if override:
             payload["override"] = True
@@ -243,15 +308,15 @@ def proxy_translate_resources(resources: List[StringResource], target_language: 
                 print(f"Translation proxy returned nothing for '{label}' — aborting",
                       file=sys.stderr)
                 sys.exit(1)
-            translated.append(replace(resource, value=by_id[label]))
+            translated.append(translated_resource(resource, by_id[label], use_xml))
     return translated
 
 def placeholder_warnings(source_value: str, translated_value: str) -> List[str]:
     """Android placeholders (%1$s, %2$d, ...) and escaped apostrophes must survive translation."""
-    problems = [
-        placeholder for placeholder in PLACEHOLDER_PATTERN.findall(source_value)
-        if placeholder not in translated_value
-    ]
+    # Compare counts: losing one of two identical placeholders is still a bug.
+    missing = (Counter(PLACEHOLDER_PATTERN.findall(source_value))
+               - Counter(PLACEHOLDER_PATTERN.findall(translated_value)))
+    problems = list(missing.elements())
     if "\\'" in source_value and "\\'" not in translated_value:
         problems.append("escaped apostrophe \\'")
     return problems
@@ -404,19 +469,16 @@ def set_comment(soup, element, context, indent: str = "    ") -> bool:
 
 def upsert_string(soup, root, entry: dict) -> str:
     """Adds or updates a plain <string> element. Returns 'added', 'updated' or 'unchanged'."""
-    value = escape_android_value(entry["value"])
     existing = root.find("string", attrs={"name": entry["name"]})
     if existing is not None:
         changed = drop_missing_translation_marker(existing)
         changed = set_comment(soup, existing, entry.get("context")) or changed
-        if existing.get_text() == value and not changed:
-            return "unchanged"
-        if existing.get_text() != value:
-            existing.string = value
-        return "updated"
+        before = existing.decode_contents()
+        set_resource_value(existing, entry)
+        return "updated" if changed or existing.decode_contents() != before else "unchanged"
     tag = soup.new_tag("string")
     tag["name"] = entry["name"]
-    tag.string = value
+    set_resource_value(tag, entry)
     append_indented(root, tag, "    ")
     set_comment(soup, tag, entry.get("context"))
     return "added"
@@ -435,17 +497,17 @@ def upsert_plurals(soup, root, group: List[dict]) -> str:
         changed = drop_missing_translation_marker(element)
         changed = set_comment(soup, element, group[0].get("context")) or changed
     for entry in sorted(group, key=lambda e: e.get("quantity", "")):
-        value = escape_android_value(entry["value"])
         item = element.find("item", attrs={"quantity": entry.get("quantity")})
         if item is None:
             item = soup.new_tag("item")
             item["quantity"] = entry.get("quantity")
-            item.string = value
+            set_resource_value(item, entry)
             append_indented(element, item, "        ")
             changed = True
-        elif item.get_text() != value:
-            item.string = value
-            changed = True
+        else:
+            before = item.decode_contents()
+            set_resource_value(item, entry)
+            changed = changed or item.decode_contents() != before
     if created:
         element.append(NavigableString("\n    "))
         set_comment(soup, element, group[0].get("context"))
@@ -469,14 +531,13 @@ def upsert_string_array(soup, root, group: List[dict]) -> str:
     items = element.find_all("item")
     for entry in sorted(group, key=lambda e: e["index"]):
         index = entry["index"]
-        value = escape_android_value(entry["value"])
         if index < len(items):
-            if items[index].get_text() != value:
-                items[index].string = value
-                changed = True
+            before = items[index].decode_contents()
+            set_resource_value(items[index], entry)
+            changed = changed or items[index].decode_contents() != before
         else:
             item = soup.new_tag("item")
-            item.string = value
+            set_resource_value(item, entry)
             append_indented(element, item, "        ")
             changed = True
     if created:
@@ -499,7 +560,7 @@ def write_language_file(source_file: str, language: str, translations: List[dict
 
     if destination.is_file():
         with open(destination, 'r', encoding='utf-8') as f:
-            soup = BeautifulSoup(f, 'xml')
+            soup = BeautifulSoup(f, 'xml', preserve_whitespace_tags={'string', 'item', 'resource'})
         created = False
     else:
         soup = BeautifulSoup("<resources></resources>", "xml")
@@ -559,7 +620,7 @@ def write_language_file(source_file: str, language: str, translations: List[dict
 def clean_source_markers(source_file: str, completed: set, dry_run: bool = False) -> None:
     """Removes MissingTranslation markers from source entries translated into every language."""
     with open(source_file, 'r', encoding='utf-8') as f:
-        soup = BeautifulSoup(f, 'xml')
+        soup = BeautifulSoup(f, 'xml', preserve_whitespace_tags={'string', 'item', 'resource'})
     root = soup.find("resources")
     reindent(root, "    ", "")
     for element in root.find_all(["plurals", "string-array"]):

@@ -66,7 +66,7 @@ Plain strings keep the exact three-key shape; the extra fields only appear on ar
 ### 2. Translate with DeepL
 
 ```bash
-python3 translate.py --translate [input.json] [output.json]
+python3 translate.py --translate [input.json] [output.json] [--override]
 # input defaults to missing_translations.json, output to translations.json
 ```
 
@@ -157,8 +157,21 @@ proxy forwards each same-options group to DeepL in one call. Errors keep DeepL's
 
 **Caching caveat:** the proxy keys its cache by id, languages and options — deliberately
 *not* by source text. If you edit an English string, its id stays the same and the proxy
-returns the previously cached translation. To force a re-translation, rename the resource
-or stop the server and clear its database file.
+returns the previously cached translation. To refresh translations after changing source
+text, use:
+
+```bash
+python3 translate.py --translate missing_translations.json translations.json --override
+```
+
+`--override` requires `DEEPL_BASE_URL` and sends the JSON boolean `"override": true`
+on every proxy batch, for every target language. The server skips cached values and
+replaces saved translations for the requested IDs and effective settings. Without
+this flag, cached translations are reused as before. Other language/context variants
+are retained. The flag is handled by the Go server and never forwarded to DeepL.
+Refreshing uses DeepL again and consumes translation quota. It only affects resources
+in the input report; mark changed source entries with `MissingTranslation` before
+extracting them again.
 
 ## Typical full cycle
 

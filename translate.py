@@ -1,4 +1,5 @@
 import sys
+import argparse
 import json
 import os
 import re
@@ -191,11 +192,14 @@ def translate_resources(resources: List[StringResource], target_language: str,
 
 def proxy_translate_resources(resources: List[StringResource], target_language: str,
                               base_url: str, api_key: str,
-                              source_language: str = "EN") -> List[StringResource]:
+                              source_language: str = "EN", override: bool = False) -> List[StringResource]:
     """Translate through the godeepl-server proxy (DEEPL_BASE_URL): every text travels
     under its Android name so the server can cache translations per id; responses are
     matched back by name. Batched at 50 texts per request — the proxy forwards each
-    same-options group to DeepL in one call and DeepL caps requests at 50 texts."""
+    same-options group to DeepL in one call and DeepL caps requests at 50 texts.
+
+    override=True skips the server cache and replaces saved translations for every
+    id in each batch. This proxy-only flag defaults to False (reuse cached values)."""
     endpoint = f"{base_url.rstrip('/')}/v2/translate"
     headers = {"Authorization": f"DeepL-Auth-Key {api_key}"}
 
@@ -216,6 +220,9 @@ def proxy_translate_resources(resources: List[StringResource], target_language: 
                 for resource in chunk
             ],
         }
+        # Cache control belongs to the Go proxy, never the direct DeepL API.
+        if override:
+            payload["override"] = True
         response = requests.post(endpoint, json=payload, headers=headers, timeout=300)
         try:
             response.raise_for_status()
@@ -249,12 +256,15 @@ def placeholder_warnings(source_value: str, translated_value: str) -> List[str]:
         problems.append("escaped apostrophe \\'")
     return problems
 
-def run_translation(input_file: str, output_file: str) -> None:
+def run_translation(input_file: str, output_file: str, override: bool = False) -> None:
     """Reads an extraction report, translates every string into TARGET_LANGUAGES.
 
     Routes through the godeepl-server proxy when DEEPL_BASE_URL is set,
-    otherwise calls DeepL directly."""
+    otherwise calls DeepL directly. override refreshes all requested proxy cache
+    entries and requires DEEPL_BASE_URL; it is never sent directly to DeepL."""
     base_url = os.environ.get("DEEPL_BASE_URL")
+    if override and not base_url:
+        raise SystemExit("Error: --override requires DEEPL_BASE_URL (the Go translation proxy).")
     api_key = os.environ.get("DEEPL_API_KEY")
     if not api_key:
         print("Error: DEEPL_API_KEY environment variable is not set.", file=sys.stderr)
@@ -277,7 +287,8 @@ def run_translation(input_file: str, output_file: str) -> None:
         for language in TARGET_LANGUAGES:
             print(f"Translating {len(resources)} strings from '{file_name}' to {language}...")
             if base_url:
-                translated = proxy_translate_resources(resources, language, base_url, api_key)
+                translated = proxy_translate_resources(
+                    resources, language, base_url, api_key, override=override)
             else:
                 translated = translate_resources(resources, language, api_key)
 
@@ -606,11 +617,15 @@ def run_write_back(input_file: str, dry_run: bool = False) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] == "--translate":
-        # Translate a previous extraction report with the DeepL API.
-        # Usage: python3 translate.py --translate [input.json] [output.json]
-        input_file = sys.argv[2] if len(sys.argv) > 2 else "missing_translations.json"
-        output_file = sys.argv[3] if len(sys.argv) > 3 else "translations.json"
-        run_translation(input_file, output_file)
+        # --override refreshes cached IDs after source text changes; proxy only.
+        # Usage: python3 translate.py --translate [input.json] [output.json] [--override]
+        parser = argparse.ArgumentParser(description="Translate an extraction report.")
+        parser.add_argument("input", nargs="?", default="missing_translations.json")
+        parser.add_argument("output", nargs="?", default="translations.json")
+        parser.add_argument("--override", action="store_true",
+                            help="Refresh all requested cached translations (requires DEEPL_BASE_URL).")
+        args = parser.parse_args(sys.argv[2:])
+        run_translation(args.input, args.output, override=args.override)
         sys.exit(0)
 
     if len(sys.argv) >= 2 and sys.argv[1] == "--write-back":
@@ -623,8 +638,9 @@ if __name__ == "__main__":
 
     if len(sys.argv) < 2:
         print("Usage: python3 translate.py <folder_path>                     extract strings to JSON", file=sys.stderr)
-        print("       python3 translate.py --translate [input] [output]      translate via DeepL API", file=sys.stderr)
+        print("       python3 translate.py --translate [input] [output] [--override]  translate via DeepL API", file=sys.stderr)
         print("         set DEEPL_BASE_URL to route through a godeepl-server proxy", file=sys.stderr)
+        print("         --override refreshes cached translations; requires DEEPL_BASE_URL", file=sys.stderr)
         print("       python3 translate.py --write-back [input] [--dry-run]  write values-<lang> XML files", file=sys.stderr)
         print("Example: python3 translate.py ./app/src/main/res", file=sys.stderr)
         sys.exit(1)

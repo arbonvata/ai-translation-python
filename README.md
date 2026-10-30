@@ -77,7 +77,7 @@ python3 translate.py --translate [input.json] [output.json] [--override]
 # input defaults to missing_translations.json, output to translations.json
 ```
 
-Translates every `value` into `da, de, es, fr, sv` (see `TARGET_LANGUAGES` in the script) and
+Translates every `value` into `da, de, es, fr, sv` (see `TARGET_LANGUAGES` in `translation_tool/models.py`) and
 writes:
 
 - `translations.json` — combined output, one entry per (source file, language)
@@ -224,3 +224,33 @@ counts, request batching, response ID mapping, and the proxy override flag. API
 requests are mocked: tests do not require credentials or spend translation quota.
 GitHub Actions runs the suite on Python 3.11 and 3.14. Live DeepL translation and
 Android builds are not part of this test suite.
+
+### Code organization
+
+`translate.py` is the CLI entry point; the existing commands and JSON report formats
+are unchanged. Implementation lives in `translation_tool/`:
+
+| Module | Responsibility |
+| --- | --- |
+| `models.py` | Resource data, target languages, IDs, placeholder checks, and `TranslationError` |
+| `android_xml.py` | XML extraction, inline markup, comments, and locale-file updates |
+| `client.py` | Direct DeepL and Go proxy requests, batching, response validation, and routing |
+| `workflows.py` | Extraction reports, translation output files, and write-back coordination |
+| `cli.py` | Argument parsing and user-facing error messages |
+
+Library functions raise exceptions instead of terminating the process. The CLI
+reports expected errors and returns a nonzero status. For programmatic use, import
+from the responsible module, for example:
+
+```python
+from translation_tool.client import TranslationClient
+from translation_tool.models import StringResource
+
+client = TranslationClient(api_key="local", base_url="http://127.0.0.1:8080")
+translated = client.translate([StringResource("hello", "Hello", "Greeting")], "da")
+```
+
+`TranslationClient(..., override=True)` refreshes proxy cache entries and requires
+`base_url`. Credentials and routing can also be read from the environment by the
+CLI. `--dry-run` continues to preview write-back without modifying locale files or
+source markers.

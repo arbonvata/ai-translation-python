@@ -1,8 +1,10 @@
 # python-translation
 
-Translates the string resources of the Kids Activity Tracker Android app (sibling repo
-`../kidsactivitytracker`) into Danish, German, Spanish, French and Swedish using the official
-DeepL API.
+Translates string resources for any Android project into Danish, German, Spanish,
+French and Swedish using the official DeepL API. Point the script at your project's
+Android resource folder; the project does not need to be in a specific repository
+or location. Source text is expected to be in English, and target languages are
+configured in `TARGET_LANGUAGES` in `translation_tool/models.py`.
 
 The tool is a three-step pipeline:
 
@@ -41,8 +43,8 @@ Do **not** hardcode the key in `translate.py` — this repo is git-tracked.
 
 ## Usage
 
-All examples use `RES` as shorthand for the Android resource folder, e.g.
-`/home/arbon/code/kidsactivitytracker/app/src/main/res`.
+All examples use `RES` as shorthand for your Android module's resource folder, e.g.
+`/path/to/your-android-project/app/src/main/res`. Replace `<RES>` with that path.
 
 ### 1. Extract untranslated strings
 
@@ -89,7 +91,7 @@ Android name, translations are cached in the server's database, and the client's
 `DEEPL_API_KEY` can be any dummy value.
 
 The output objects have the same shape as the extraction output; only `value` is translated.
-A full run is roughly 60–70k characters, well within the free tier's 500k/month.
+Translation usage depends on the amount of source text and the number of target languages.
 
 Details worth knowing:
 

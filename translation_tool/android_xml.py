@@ -12,6 +12,9 @@ from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 from .models import StringResource
 
 
+RESOURCE_TAGS = ("string", "string-array", "plurals")
+
+
 def get_string_xml_files(folder_path):
     """Finds all .xml files containing 'string' in the name."""
     target_dir = Path(folder_path)
@@ -106,7 +109,7 @@ def extract_missing_translations(file_path: str) -> list[StringResource]:
     soup = read_resource_xml(file_path)
     return [
         resource
-        for tag in soup.find_all(["string", "string-array", "plurals"])
+        for tag in soup.find_all(RESOURCE_TAGS)
         if "MissingTranslation" in tag.get("tools:ignore", "")
         for resource in extract_tag_resources(tag)
     ]
@@ -123,6 +126,31 @@ def android_destination(source_file: str, language: str):
     if source.parent.name != "values":
         return None
     return source.parent.parent / f"values-{language}" / source.name
+
+
+def localized_resources(folder):
+    """Index by Android resource name and type, which are independent of the XML filename."""
+    resources = {}
+    for path in sorted(folder.glob("*.xml")):
+        root = read_resource_xml(path).resources
+        if root is None:
+            continue
+        for tag in root.find_all(RESOURCE_TAGS, recursive=False):
+            resources[tag.name, tag.get("name")] = (path, tag)
+    return resources
+
+
+def missing_items(source, localized):
+    """Return missing resource values, including incomplete arrays and plurals."""
+    if localized is None or "MissingTranslation" in source.get("tools:ignore", ""):
+        return list(extract_tag_resources(source))
+    if source.name == "string":
+        return []
+    items = localized.find_all("item")
+    if source.name == "string-array":
+        return [item for item in extract_tag_resources(source) if item.index >= len(items)]
+    quantities = {item.get("quantity") for item in items}
+    return [item for item in extract_tag_resources(source) if item.quantity not in quantities]
 
 
 def append_indented(parent, tag, indent: str) -> None:
@@ -311,9 +339,9 @@ def apply_translations(soup, root, translations):
     return counts
 
 
-def write_language_file(source_file, language, translations, dry_run=False):
+def write_language_file(source_file, language, translations, dry_run=False, *, destination=None):
     """Upsert one locale file; return False only when its source path is skipped."""
-    destination = android_destination(source_file, language)
+    destination = destination or android_destination(source_file, language)
     if destination is None:
         print(f"Skipping '{source_file}': not inside a 'values' folder", file=sys.stderr)
         return False
@@ -343,7 +371,7 @@ def clean_source_markers(source_file, completed, dry_run=False):
     soup = read_resource_xml(source_file)
     root = normalize_resource_xml(soup)
     removed = 0
-    for tag in root.find_all(["string", "string-array", "plurals"]):
+    for tag in root.find_all(RESOURCE_TAGS):
         kind = None if tag.name == "string" else tag.name
         if (kind, tag.get("name")) in completed and "MissingTranslation" in tag.get("tools:ignore", ""):
             removed += drop_missing_translation_marker(tag)

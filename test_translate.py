@@ -1,4 +1,5 @@
 import contextlib
+from dataclasses import replace
 import io
 import os
 from pathlib import Path
@@ -278,6 +279,56 @@ class CliTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()) as stderr:
             self.assertEqual(main([]), 1)
         self.assertIn('--write-back', stderr.getvalue())
+
+
+class ProjectTranslationTests(unittest.TestCase):
+    def test_scans_string_files_and_fills_only_missing_localized_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res = Path(tmp)
+            values = res / 'values'
+            values.mkdir()
+            (values / 'strings.xml').write_text('''<resources xmlns:tools="http://schemas.android.com/tools">
+                <string name="existing">Existing</string>
+                <string name="refresh" tools:ignore="MissingTranslation">Refresh</string>
+                <string name="brand" translatable="false">Brand</string>
+                <string-array name="days"><item>Monday</item><item>Tuesday</item></string-array>
+            </resources>''')
+            (values / 'strings_calendar.xml').write_text(
+                '<resources><string name="calendar">Calendar</string></resources>')
+            (values / 'other.xml').write_text('<resources><string name="ignored">Ignored</string></resources>')
+            danish = res / 'values-da'
+            danish.mkdir()
+            (danish / 'custom.xml').write_text('''<resources>
+                <string name="existing">Existing Danish translation</string>
+                <string name="refresh">Old Danish translation</string>
+                <string-array name="days"><item>Mandag</item></string-array>
+            </resources>''')
+
+            def translate_batch(resources, language):
+                return [replace(resource, value=f'{language}: {resource.value}') for resource in resources]
+
+            args = ['--project', str(values)]
+            with patch.object(workflows, 'configured_client') as configured, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(translate.main([*args, '--dry-run']), 0)
+                configured.assert_not_called()
+                self.assertFalse((danish / 'strings_calendar.xml').exists())
+                configured.return_value.translate.side_effect = translate_batch
+                self.assertEqual(translate.main(args), 0)
+                configured.reset_mock()
+                self.assertEqual(translate.main(args), 0)
+                configured.assert_not_called()
+
+            self.assertFalse((danish / 'strings.xml').exists())
+            localized = ET.parse(danish / 'custom.xml')
+            self.assertEqual(localized.findtext("string[@name='existing']"), 'Existing Danish translation')
+            self.assertEqual(localized.findtext("string[@name='refresh']"), 'da: Refresh')
+            self.assertEqual([item.text for item in localized.findall('string-array/item')], ['Mandag', 'da: Tuesday'])
+            for language in models.TARGET_LANGUAGES:
+                folder = res / f'values-{language}'
+                self.assertEqual(ET.parse(folder / 'strings_calendar.xml').findtext('string'), f'{language}: Calendar')
+                self.assertFalse((folder / 'other.xml').exists())
+            self.assertIsNone(ET.parse(res / 'values-fr' / 'strings.xml').find("string[@name='brand']"))
+            self.assertNotIn('MissingTranslation', (values / 'strings.xml').read_text())
 
 
 class WriteBackTests(unittest.TestCase):

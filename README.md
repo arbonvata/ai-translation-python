@@ -6,7 +6,27 @@ Android resource folder; the project does not need to be in a specific repositor
 or location. Source text is expected to be in English, and target languages are
 configured in `TARGET_LANGUAGES` in `translation_tool/models.py`.
 
-The tool is a three-step pipeline:
+To translate an app and write the locale XML files in one command, pass its default
+`values` directory:
+
+```bash
+python translate.py --project /path/to/app/src/main/res/values --dry-run
+python translate.py --project /path/to/app/src/main/res/values
+```
+
+The command reads every `string*.xml` file directly in `values` and fills missing
+strings, plurals, and string-array items in `values-da`, `values-de`, `values-es`,
+`values-fr`, and `values-sv`. New resources use the English XML filename, for
+example `values/strings_calendar.xml` creates `values-da/strings_calendar.xml`
+when needed. Existing definitions can live in any XML file in the locale folder.
+Existing translations are kept unless the English resource is marked with
+`tools:ignore="MissingTranslation"`. Resources marked `translatable="false"` are
+skipped. Add `--override` with the proxy to refresh cached results for the
+entries included in the run. `--dry-run` prints the pending changes without
+credentials or API calls.
+
+You can also run the three steps individually to inspect and edit JSON before
+writing the results:
 
 ```
 extract ──► missing_translations.json ──► translate ──► translations.json (+ per-language files)

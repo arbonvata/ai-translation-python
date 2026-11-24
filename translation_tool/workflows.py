@@ -6,9 +6,14 @@ from pathlib import Path
 import sys
 
 from .android_xml import (
+    RESOURCE_TAGS,
+    android_destination,
     clean_source_markers,
     extract_missing_translations,
     get_string_xml_files,
+    localized_resources,
+    missing_items,
+    read_resource_xml,
     write_language_file,
 )
 from .client import TranslationClient
@@ -81,33 +86,89 @@ def print_translation_summary(input_count, output_file, language_files, warnings
     print("Per-language files:")
     for path in language_files:
         print(f"  {path}")
+    print_placeholder_warnings(warnings)
+
+
+def print_placeholder_warnings(warnings):
     if warnings:
         print(f"\n{len(warnings)} placeholder warnings — review these translations:", file=sys.stderr)
         for warning in warnings:
             print(f"  - {warning}", file=sys.stderr)
 
 
-def run_translation(input_file, output_file, override=False):
-    """Load environment configuration and run the report translation pipeline."""
-    client = TranslationClient(
+def configured_client(override):
+    return TranslationClient(
         api_key=os.environ.get("DEEPL_API_KEY", ""),
         base_url=os.environ.get("DEEPL_BASE_URL"), override=override,
     )
+
+
+def run_translation(input_file, output_file, override=False):
+    """Load environment configuration and run the report translation pipeline."""
+    client = configured_client(override)
     report = read_json(input_file)
     output, warnings = translate_report(report, client)
     language_files = save_translation_outputs(output_file, output)
     print_translation_summary(len(report), output_file, language_files, warnings)
 
 
+def plan_project_translations(values):
+    locale_resources = {
+        language: localized_resources(values.parent / f"values-{language}")
+        for language in TARGET_LANGUAGES
+    }
+    pending = {}
+    for source in sorted(path for path in values.glob("string*.xml") if path.is_file()):
+        root = read_resource_xml(source).resources
+        if root is None:
+            raise ValueError(f"Android XML must contain a <resources> element: {source}")
+        for tag in root.find_all(RESOURCE_TAGS, recursive=False):
+            name = tag.get("name")
+            if not name or tag.get("translatable") == "false":
+                continue
+            for language, resources in locale_resources.items():
+                destination, localized = resources.get((tag.name, name), (None, None))
+                items = missing_items(tag, localized)
+                if items:
+                    destination = destination or android_destination(source, language)
+                    pending.setdefault((source, language, destination), []).extend(items)
+    return pending
+
+
+def run_project_translation(folder, *, dry_run=False, override=False):
+    values = Path(folder)
+    if values.name != "values" or not values.is_dir():
+        raise ValueError(f"Expected the app's default 'values' directory: {values}")
+    pending = plan_project_translations(values)
+    if not pending:
+        print(f"No pending translations in {values}")
+        return
+    if dry_run:
+        for (_, _, destination), resources in pending.items():
+            print(f"Would translate {len(resources)} values for {destination}")
+        return
+
+    client = configured_client(override)
+    output, warnings = {}, []
+    for (source, language, destination), resources in pending.items():
+        print(f"Translating {len(resources)} values from '{source.name}' to {language}...")
+        translated = client.translate(resources, language)
+        warnings.extend(resource_warnings(resources, translated, language))
+        output.setdefault(source, []).append((language, [item.to_dict() for item in translated], destination))
+    print_placeholder_warnings(warnings)
+    for source, entries in output.items():
+        write_source_translations(source, entries, dry_run=False)
+
+
 def write_source_translations(source_file, entries, dry_run):
     """Track successful writes before removing fully translated source markers."""
     written = {}
-    for entry in entries:
-        if not write_language_file(source_file, entry["language"], entry["translations"], dry_run):
+    for language, translations, destination in entries:
+        if not write_language_file(source_file, language, translations, dry_run, destination=destination):
             continue
-        for translation in entry["translations"]:
+        for translation in translations:
             key = (translation.get("type"), translation["name"])
-            written.setdefault(key, set()).add(entry["language"])
+            written.setdefault(key, set()).add(language)
     completed = {key for key, languages in written.items() if languages >= set(TARGET_LANGUAGES)}
     if completed:
         clean_source_markers(source_file, completed, dry_run)
@@ -117,6 +178,6 @@ def run_write_back(input_file, dry_run=False):
     """Write locale files, then clean markers only for completed resources."""
     entries_by_file = {}
     for entry in read_json(input_file):
-        entries_by_file.setdefault(entry["file"], []).append(entry)
+        entries_by_file.setdefault(entry["file"], []).append((entry["language"], entry["translations"], None))
     for source_file, entries in entries_by_file.items():
         write_source_translations(source_file, entries, dry_run)

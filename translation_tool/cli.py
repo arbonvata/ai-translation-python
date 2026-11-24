@@ -5,12 +5,13 @@ import sys
 from xml.etree import ElementTree
 
 from .models import TranslationError
-from .workflows import run_extraction, run_translation, run_write_back
+from .workflows import run_extraction, run_project_translation, run_translation, run_write_back
 
 
 USAGE = """python3 translate.py <folder_path> [output.json]
        python3 translate.py --translate [input.json] [output.json] [--override]
-       python3 translate.py --write-back [input.json] [--dry-run]"""
+       python3 translate.py --write-back [input.json] [--dry-run]
+       python3 translate.py --project <values_dir> [--dry-run] [--override]"""
 
 
 def parse_arguments(argv):
@@ -20,6 +21,13 @@ def parse_arguments(argv):
         description="Extract, translate, and write Android string resources.",
         epilog="Set DEEPL_BASE_URL to use the Go proxy; --override refreshes its cached translations.",
     )
+    if argv and argv[0] == "--project":
+        parser.add_argument("--project", metavar="values_dir", required=True,
+                            help="Translate the app's default Android values directory in place.")
+        parser.add_argument("--dry-run", action="store_true", help="List pending changes without calling DeepL.")
+        parser.add_argument("--override", action="store_true",
+                            help="Refresh requested cached translations (requires DEEPL_BASE_URL).")
+        return "project", parser.parse_args(argv)
     if argv and argv[0] == "--translate":
         parser.add_argument("--translate", action="store_true", required=True)
         parser.add_argument("input", nargs="?", default="missing_translations.json")
@@ -46,7 +54,9 @@ def main(argv=None):
     if mode is None:
         return 1
     try:
-        if mode == "translate":
+        if mode == "project":
+            run_project_translation(args.project, dry_run=args.dry_run, override=args.override)
+        elif mode == "translate":
             run_translation(args.input, args.output, override=args.override)
         elif mode == "write-back":
             run_write_back(args.input, dry_run=args.dry_run)
